@@ -1,12 +1,12 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import sqlite3
 import json
 import httpx
 import random
-import hashlib
+from datetime import datetime
 
 app = FastAPI(title="Stock Topic Finder API")
 
@@ -29,9 +29,14 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
     c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS saved_topics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
             topic TEXT NOT NULL,
             type TEXT,
             demand TEXT,
@@ -45,7 +50,6 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS search_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
             keyword TEXT NOT NULL,
             results_count INTEGER,
             searched_at TEXT DEFAULT (datetime('now'))
@@ -56,10 +60,16 @@ def init_db():
 
 init_db()
 
-# --- Models ---
+# Models
+class ApiKeyRequest(BaseModel):
+    api_key: str
+
 class SearchRequest(BaseModel):
     keyword: str
     topic_type: Optional[str] = "all"
+    category: Optional[str] = "all"
+    country: Optional[str] = "worldwide"
+    time_range: Optional[str] = "past_12_months"
 
 class SaveTopicRequest(BaseModel):
     topic: str
@@ -70,24 +80,56 @@ class SaveTopicRequest(BaseModel):
     opportunity_score: int
     keyword: str
 
-# --- Helpers ---
-def get_user_id(api_key: str) -> str:
-    """API key থেকে SHA256 hash বানাও — এটাই user_id, key কখনো store হবে না।"""
-    return hashlib.sha256(api_key.strip().encode()).hexdigest()
+# Settings
+@app.get("/api/settings")
+def get_settings():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT key, value FROM settings")
+    rows = c.fetchall()
+    conn.close()
+    settings = {r["key"]: r["value"] for r in rows}
+    api_key = settings.get("groq_api_key", "")
+    masked = ""
+    if api_key:
+        masked = api_key[:4] + "*" * (len(api_key) - 4) if len(api_key) > 4 else "****"
+    return {"has_api_key": bool(api_key), "masked_key": masked}
 
-def require_api_key(x_api_key: Optional[str]) -> tuple[str, str]:
-    """Header থেকে key নাও, না থাকলে 401 দাও। (key, user_id) return করো।"""
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="API key missing. Please enter your Groq API key.")
-    return x_api_key, get_user_id(x_api_key)
+@app.post("/api/settings/api-key")
+def save_api_key(req: ApiKeyRequest):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("groq_api_key", req.api_key))
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "API key saved successfully"}
+
+@app.delete("/api/settings/api-key")
+def delete_api_key():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM settings WHERE key = 'groq_api_key'")
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+# Helpers
+def get_groq_api_key():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = 'groq_api_key'")
+    row = c.fetchone()
+    conn.close()
+    return row["value"] if row else None
 
 def compute_opportunity_score(demand, trend_pct, competition):
     demand_w = {"High": 40, "Medium": 25, "Low": 10}.get(demand, 20)
     trend_w = min(max(int(trend_pct / 2), -15), 30)
     comp_w = {"Low": 0, "Medium": -10, "High": -25}.get(competition, -10)
-    return max(0, min(100, demand_w + trend_w + 40 + comp_w))
+    score = demand_w + trend_w + 40 + comp_w
+    return max(0, min(100, score))
 
-async def generate_topics_with_groq(keyword: str, api_key: str):
+async def generate_topics_with_groq(keyword, api_key):
     prompt = f"""Generate exactly 20 Adobe Stock content topics for the keyword "{keyword}".
 Mix of Main Topics (5) and Sub Topics (15).
 For each topic return JSON with these fields:
@@ -111,10 +153,8 @@ Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
             }
         )
 
-    if resp.status_code == 401:
-        raise HTTPException(status_code=401, detail="Invalid API key. Please check your Groq API key.")
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Groq API error: {resp.status_code}")
+        raise Exception(f"Groq error: {resp.text}")
 
     content = resp.json()["choices"][0]["message"]["content"].strip()
     if content.startswith("```"):
@@ -128,6 +168,7 @@ Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
         trend_pct = float(t.get("trend_percent", random.uniform(-10, 30)))
         demand = t.get("demand", "Medium")
         competition = t.get("competition", "Medium")
+        score = compute_opportunity_score(demand, trend_pct, competition)
         result.append({
             "id": i + 1,
             "topic": t["topic"],
@@ -135,7 +176,7 @@ Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
             "demand": demand,
             "competition": competition,
             "trend_percent": round(trend_pct, 1),
-            "opportunity_score": compute_opportunity_score(demand, trend_pct, competition),
+            "opportunity_score": score,
         })
     return result
 
@@ -152,33 +193,30 @@ def generate_mock_topics(keyword):
         ("{kw} Eco Sustainable", "Sub Topic", "Medium", "Low", 30),
         ("{kw} Vintage Retro Style", "Sub Topic", "Low", "Low", 10),
     ]
-    return [
-        {
+    result = []
+    for i, (tmpl, typ, dem, comp, trend) in enumerate(templates):
+        score = compute_opportunity_score(dem, trend, comp)
+        result.append({
             "id": i + 1,
             "topic": tmpl.replace("{kw}", keyword.title()),
-            "type": typ, "demand": dem, "competition": comp,
+            "type": typ,
+            "demand": dem,
+            "competition": comp,
             "trend_percent": float(trend),
-            "opportunity_score": compute_opportunity_score(dem, trend, comp),
-        }
-        for i, (tmpl, typ, dem, comp, trend) in enumerate(templates)
-    ]
+            "opportunity_score": score,
+        })
+    return result
 
-# --- Search ---
 @app.post("/api/search")
-async def search_topics(
-    req: SearchRequest,
-    x_api_key: Optional[str] = Header(default=None)
-):
-    api_key, user_id = require_api_key(x_api_key)
-    used_fallback = False
-
-    try:
-        topics = await generate_topics_with_groq(req.keyword, api_key)
-    except HTTPException:
-        raise
-    except Exception:
+async def search_topics(req: SearchRequest):
+    api_key = get_groq_api_key()
+    if api_key:
+        try:
+            topics = await generate_topics_with_groq(req.keyword, api_key)
+        except Exception:
+            topics = generate_mock_topics(req.keyword)
+    else:
         topics = generate_mock_topics(req.keyword)
-        used_fallback = True
 
     if req.topic_type and req.topic_type != "all":
         label = "Main Topic" if req.topic_type == "main" else "Sub Topic"
@@ -186,83 +224,65 @@ async def search_topics(
 
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO search_history (user_id, keyword, results_count) VALUES (?, ?, ?)",
-        (user_id, req.keyword, len(topics))
-    )
+    c.execute("INSERT INTO search_history (keyword, results_count) VALUES (?, ?)", (req.keyword, len(topics)))
     conn.commit()
     conn.close()
 
-    return {"keyword": req.keyword, "total": len(topics), "topics": topics, "used_fallback": used_fallback}
+    return {"keyword": req.keyword, "total": len(topics), "topics": topics}
 
-# --- Saved Topics ---
 @app.get("/api/saved-topics")
-def get_saved_topics(x_api_key: Optional[str] = Header(default=None)):
-    _, user_id = require_api_key(x_api_key)
+def get_saved_topics():
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM saved_topics WHERE user_id = ? ORDER BY saved_at DESC", (user_id,))
+    c.execute("SELECT * FROM saved_topics ORDER BY saved_at DESC")
     rows = c.fetchall()
     conn.close()
     return {"topics": [dict(r) for r in rows]}
 
 @app.post("/api/saved-topics")
-def save_topic(req: SaveTopicRequest, x_api_key: Optional[str] = Header(default=None)):
-    _, user_id = require_api_key(x_api_key)
+def save_topic(req: SaveTopicRequest):
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "SELECT id FROM saved_topics WHERE user_id = ? AND topic = ? AND keyword = ?",
-        (user_id, req.topic, req.keyword)
-    )
+    c.execute("SELECT id FROM saved_topics WHERE topic = ? AND keyword = ?", (req.topic, req.keyword))
     if c.fetchone():
         conn.close()
         raise HTTPException(status_code=409, detail="Topic already saved")
     c.execute("""
-        INSERT INTO saved_topics (user_id, topic, type, demand, competition, trend_percent, opportunity_score, keyword)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, req.topic, req.type, req.demand, req.competition, req.trend_percent, req.opportunity_score, req.keyword))
+        INSERT INTO saved_topics (topic, type, demand, competition, trend_percent, opportunity_score, keyword)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (req.topic, req.type, req.demand, req.competition, req.trend_percent, req.opportunity_score, req.keyword))
     conn.commit()
     new_id = c.lastrowid
     conn.close()
     return {"success": True, "id": new_id}
 
 @app.delete("/api/saved-topics/{topic_id}")
-def delete_saved_topic(topic_id: int, x_api_key: Optional[str] = Header(default=None)):
-    _, user_id = require_api_key(x_api_key)
+def delete_saved_topic(topic_id: int):
     conn = get_db()
     c = conn.cursor()
-    # শুধু নিজের topic delete করতে পারবে
-    c.execute("DELETE FROM saved_topics WHERE id = ? AND user_id = ?", (topic_id, user_id))
+    c.execute("DELETE FROM saved_topics WHERE id = ?", (topic_id,))
     conn.commit()
     conn.close()
     return {"success": True}
 
-# --- History ---
 @app.get("/api/history")
-def get_history(x_api_key: Optional[str] = Header(default=None)):
-    _, user_id = require_api_key(x_api_key)
+def get_history():
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM search_history WHERE user_id = ? ORDER BY searched_at DESC LIMIT 50",
-        (user_id,)
-    )
+    c.execute("SELECT * FROM search_history ORDER BY searched_at DESC LIMIT 50")
     rows = c.fetchall()
     conn.close()
     return {"history": [dict(r) for r in rows]}
 
 @app.delete("/api/history")
-def clear_history(x_api_key: Optional[str] = Header(default=None)):
-    _, user_id = require_api_key(x_api_key)
+def clear_history():
     conn = get_db()
     c = conn.cursor()
-    c.execute("DELETE FROM search_history WHERE user_id = ?", (user_id,))
+    c.execute("DELETE FROM search_history")
     conn.commit()
     conn.close()
     return {"success": True}
 
-# --- Health ---
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
