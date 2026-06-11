@@ -1,12 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 import sqlite3
 import json
 import httpx
 import random
-from datetime import datetime
 
 app = FastAPI(title="Stock Topic Finder API")
 
@@ -28,12 +27,6 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS saved_topics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,9 +54,6 @@ def init_db():
 init_db()
 
 # Models
-class ApiKeyRequest(BaseModel):
-    api_key: str
-
 class SearchRequest(BaseModel):
     keyword: str
     topic_type: Optional[str] = "all"
@@ -80,48 +70,7 @@ class SaveTopicRequest(BaseModel):
     opportunity_score: int
     keyword: str
 
-# Settings
-@app.get("/api/settings")
-def get_settings():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT key, value FROM settings")
-    rows = c.fetchall()
-    conn.close()
-    settings = {r["key"]: r["value"] for r in rows}
-    api_key = settings.get("groq_api_key", "")
-    masked = ""
-    if api_key:
-        masked = api_key[:4] + "*" * (len(api_key) - 4) if len(api_key) > 4 else "****"
-    return {"has_api_key": bool(api_key), "masked_key": masked}
-
-@app.post("/api/settings/api-key")
-def save_api_key(req: ApiKeyRequest):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("groq_api_key", req.api_key))
-    conn.commit()
-    conn.close()
-    return {"success": True, "message": "API key saved successfully"}
-
-@app.delete("/api/settings/api-key")
-def delete_api_key():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM settings WHERE key = 'groq_api_key'")
-    conn.commit()
-    conn.close()
-    return {"success": True}
-
 # Helpers
-def get_groq_api_key():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = 'groq_api_key'")
-    row = c.fetchone()
-    conn.close()
-    return row["value"] if row else None
-
 def compute_opportunity_score(demand, trend_pct, competition):
     demand_w = {"High": 40, "Medium": 25, "Low": 10}.get(demand, 20)
     trend_w = min(max(int(trend_pct / 2), -15), 30)
@@ -129,7 +78,7 @@ def compute_opportunity_score(demand, trend_pct, competition):
     score = demand_w + trend_w + 40 + comp_w
     return max(0, min(100, score))
 
-async def generate_topics_with_groq(keyword, api_key):
+async def generate_topics_with_groq(keyword: str, api_key: str):
     prompt = f"""Generate exactly 20 Adobe Stock content topics for the keyword "{keyword}".
 Mix of Main Topics (5) and Sub Topics (15).
 For each topic return JSON with these fields:
@@ -153,8 +102,10 @@ Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
             }
         )
 
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Invalid API key. Please check your Groq API key.")
     if resp.status_code != 200:
-        raise Exception(f"Groq error: {resp.text}")
+        raise HTTPException(status_code=502, detail=f"Groq API error: {resp.status_code}")
 
     content = resp.json()["choices"][0]["message"]["content"].strip()
     if content.startswith("```"):
@@ -207,16 +158,25 @@ def generate_mock_topics(keyword):
         })
     return result
 
+# --- Search ---
 @app.post("/api/search")
-async def search_topics(req: SearchRequest):
-    api_key = get_groq_api_key()
-    if api_key:
+async def search_topics(
+    req: SearchRequest,
+    x_api_key: Optional[str] = Header(default=None)
+):
+    used_fallback = False
+
+    if x_api_key:
         try:
-            topics = await generate_topics_with_groq(req.keyword, api_key)
+            topics = await generate_topics_with_groq(req.keyword, x_api_key)
+        except HTTPException:
+            raise  # re-raise 401 / 502 directly to frontend
         except Exception:
             topics = generate_mock_topics(req.keyword)
+            used_fallback = True
     else:
         topics = generate_mock_topics(req.keyword)
+        used_fallback = True
 
     if req.topic_type and req.topic_type != "all":
         label = "Main Topic" if req.topic_type == "main" else "Sub Topic"
@@ -224,12 +184,21 @@ async def search_topics(req: SearchRequest):
 
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT INTO search_history (keyword, results_count) VALUES (?, ?)", (req.keyword, len(topics)))
+    c.execute(
+        "INSERT INTO search_history (keyword, results_count) VALUES (?, ?)",
+        (req.keyword, len(topics))
+    )
     conn.commit()
     conn.close()
 
-    return {"keyword": req.keyword, "total": len(topics), "topics": topics}
+    return {
+        "keyword": req.keyword,
+        "total": len(topics),
+        "topics": topics,
+        "used_fallback": used_fallback,
+    }
 
+# --- Saved Topics ---
 @app.get("/api/saved-topics")
 def get_saved_topics():
     conn = get_db()
@@ -243,7 +212,10 @@ def get_saved_topics():
 def save_topic(req: SaveTopicRequest):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id FROM saved_topics WHERE topic = ? AND keyword = ?", (req.topic, req.keyword))
+    c.execute(
+        "SELECT id FROM saved_topics WHERE topic = ? AND keyword = ?",
+        (req.topic, req.keyword)
+    )
     if c.fetchone():
         conn.close()
         raise HTTPException(status_code=409, detail="Topic already saved")
@@ -265,6 +237,7 @@ def delete_saved_topic(topic_id: int):
     conn.close()
     return {"success": True}
 
+# --- History ---
 @app.get("/api/history")
 def get_history():
     conn = get_db()
@@ -283,6 +256,7 @@ def clear_history():
     conn.close()
     return {"success": True}
 
+# --- Health ---
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
