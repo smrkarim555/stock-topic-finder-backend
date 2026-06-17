@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -6,6 +6,7 @@ import sqlite3
 import json
 import httpx
 import random
+import base64
 from datetime import datetime
 
 app = FastAPI(title="Stock Topic Finder API")
@@ -70,6 +71,8 @@ class SearchRequest(BaseModel):
     category: Optional[str] = "all"
     country: Optional[str] = "worldwide"
     time_range: Optional[str] = "past_12_months"
+    max_results: Optional[int] = 20
+    exclude_topics: Optional[List[str]] = None
 
 class SaveTopicRequest(BaseModel):
     topic: str
@@ -129,42 +132,18 @@ def compute_opportunity_score(demand, trend_pct, competition):
     score = demand_w + trend_w + 40 + comp_w
     return max(0, min(100, score))
 
-async def generate_topics_with_groq(keyword, api_key):
-    prompt = f"""Generate exactly 20 Adobe Stock content topics for the keyword "{keyword}".
-Mix of Main Topics (5) and Sub Topics (15).
-For each topic return JSON with these fields:
-- topic: specific descriptive topic name
-- type: "Main Topic" or "Sub Topic"
-- demand: "High", "Medium", or "Low"
-- competition: "Low", "Medium", or "High"
-- trend_percent: number between -15 and 45
-
-Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7,
-                "max_tokens": 2000,
-            }
-        )
-
-    if resp.status_code != 200:
-        raise Exception(f"Groq error: {resp.text}")
-
-    content = resp.json()["choices"][0]["message"]["content"].strip()
+def clean_json_content(content):
+    content = content.strip()
     if content.startswith("```"):
         content = content.split("```")[1]
         if content.startswith("json"):
             content = content[4:]
+    return content.strip()
 
-    topics = json.loads(content)
+def score_topics(raw_topics):
+    """Takes raw topic dicts from the AI (or mock generator) and attaches id + opportunity_score."""
     result = []
-    for i, t in enumerate(topics):
+    for i, t in enumerate(raw_topics):
         trend_pct = float(t.get("trend_percent", random.uniform(-10, 30)))
         demand = t.get("demand", "Medium")
         competition = t.get("competition", "Medium")
@@ -180,43 +159,167 @@ Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
         })
     return result
 
-def generate_mock_topics(keyword):
-    templates = [
-        ("{kw} Modern Design", "Main Topic", "High", "Low", 28),
-        ("{kw} Business Professional", "Sub Topic", "High", "Medium", 12),
-        ("{kw} Flat Icon Set", "Sub Topic", "Medium", "Low", 18),
-        ("{kw} Colorful Illustration", "Main Topic", "Medium", "Medium", 22),
-        ("{kw} Minimal Logo", "Sub Topic", "High", "High", -5),
-        ("{kw} Background Pattern", "Main Topic", "Medium", "Low", 15),
-        ("{kw} Social Media Template", "Sub Topic", "Medium", "High", -8),
-        ("{kw} Infographic Elements", "Sub Topic", "Medium", "Medium", 5),
-        ("{kw} Eco Sustainable", "Sub Topic", "Medium", "Low", 30),
-        ("{kw} Vintage Retro Style", "Sub Topic", "Low", "Low", 10),
+def build_exclusion_text(exclude):
+    if not exclude:
+        return ""
+    sample = exclude[:40]
+    return (
+        "\nDo NOT repeat any of these already-suggested topics — generate fresh, different ones:\n- "
+        + "\n- ".join(sample)
+    )
+
+async def generate_topics_with_groq(keyword, api_key, count=20, exclude=None):
+    main_count = max(1, round(count * 0.25))
+    sub_count = max(0, count - main_count)
+    exclusion_text = build_exclusion_text(exclude)
+
+    prompt = f"""Generate exactly {count} Adobe Stock content topics for the keyword "{keyword}".
+Mix of Main Topics ({main_count}) and Sub Topics ({sub_count}).
+For each topic return JSON with these fields:
+- topic: specific descriptive topic name
+- type: "Main Topic" or "Sub Topic"
+- demand: "High", "Medium", or "Low"
+- competition: "Low", "Medium", or "High"
+- trend_percent: number between -15 and 45
+{exclusion_text}
+
+Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.8,
+                "max_tokens": 2800,
+            }
+        )
+
+    if resp.status_code != 200:
+        raise Exception(f"Groq error: {resp.text}")
+
+    content = clean_json_content(resp.json()["choices"][0]["message"]["content"])
+    topics = json.loads(content)
+    return score_topics(topics)
+
+async def generate_topics_from_image_with_groq(image_b64, mime_type, api_key, count=20, exclude=None):
+    main_count = max(1, round(count * 0.25))
+    sub_count = max(0, count - main_count)
+    exclusion_text = build_exclusion_text(exclude)
+
+    prompt = f"""Look closely at this image — its subject, style, colors, and mood.
+Then generate exactly {count} Adobe Stock content topic ideas inspired by what's in the image, useful for a stock contributor creating similar icon sets, illustrations, or graphics around this theme.
+Mix of Main Topics ({main_count}) and Sub Topics ({sub_count}).
+For each topic return these fields:
+- topic: specific descriptive topic name
+- type: "Main Topic" or "Sub Topic"
+- demand: "High", "Medium", or "Low"
+- competition: "Low", "Medium", or "High"
+- trend_percent: number between -15 and 45
+{exclusion_text}
+
+Return ONLY valid JSON in this exact shape, no explanation, no markdown, no backticks:
+{{"theme": "short 3-6 word description of the image", "topics": [{{"topic": "...", "type": "...", "demand": "...", "competition": "...", "trend_percent": 0}}]}}"""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}}
+                    ]
+                }],
+                "temperature": 0.8,
+                "max_tokens": 2800,
+            }
+        )
+
+    if resp.status_code != 200:
+        raise Exception(f"Groq error: {resp.text}")
+
+    content = clean_json_content(resp.json()["choices"][0]["message"]["content"])
+    data = json.loads(content)
+    theme = data.get("theme", "Image topics")
+    topics = score_topics(data.get("topics", []))
+    return theme, topics
+
+MOCK_TEMPLATES = [
+    ("{kw} Modern Design", "Main Topic", "High", "Low", 28),
+    ("{kw} Business Professional", "Sub Topic", "High", "Medium", 12),
+    ("{kw} Flat Icon Set", "Sub Topic", "Medium", "Low", 18),
+    ("{kw} Colorful Illustration", "Main Topic", "Medium", "Medium", 22),
+    ("{kw} Minimal Logo", "Sub Topic", "High", "High", -5),
+    ("{kw} Background Pattern", "Main Topic", "Medium", "Low", 15),
+    ("{kw} Social Media Template", "Sub Topic", "Medium", "High", -8),
+    ("{kw} Infographic Elements", "Sub Topic", "Medium", "Medium", 5),
+    ("{kw} Eco Sustainable", "Sub Topic", "Medium", "Low", 30),
+    ("{kw} Vintage Retro Style", "Sub Topic", "Low", "Low", 10),
+    ("{kw} 3D Render Concept", "Main Topic", "High", "Medium", 35),
+    ("{kw} Hand Drawn Sketch", "Sub Topic", "Low", "Low", 8),
+    ("{kw} Line Art Outline", "Sub Topic", "Medium", "Low", 14),
+    ("{kw} Watercolor Texture", "Sub Topic", "Low", "Low", 6),
+    ("{kw} Corporate Banner", "Sub Topic", "Medium", "High", -3),
+    ("{kw} Gradient Abstract", "Main Topic", "Medium", "Medium", 20),
+    ("{kw} Cartoon Character", "Sub Topic", "High", "Medium", 25),
+    ("{kw} Seamless Pattern", "Sub Topic", "Medium", "Low", 17),
+    ("{kw} Isometric Illustration", "Main Topic", "High", "Medium", 32),
+    ("{kw} Doodle Set", "Sub Topic", "Low", "Low", 4),
+    ("{kw} Neon Glow Style", "Sub Topic", "Low", "Medium", 19),
+    ("{kw} Paper Cut Style", "Sub Topic", "Low", "Low", 9),
+    ("{kw} Festival Celebration", "Main Topic", "High", "Medium", 27),
+    ("{kw} Minimal Outline Icon", "Sub Topic", "Medium", "Low", 13),
+    ("{kw} Geometric Shapes", "Sub Topic", "Medium", "Medium", 11),
+    ("{kw} Children Education Theme", "Sub Topic", "High", "Medium", 21),
+    ("{kw} Vector Mascot", "Main Topic", "Medium", "Medium", 16),
+    ("{kw} Dark Mode UI Element", "Sub Topic", "Medium", "High", 7),
+    ("{kw} Sustainable Packaging", "Sub Topic", "High", "Low", 29),
+    ("{kw} Retro 80s Style", "Sub Topic", "Low", "Low", 3),
+]
+
+def generate_mock_topics(keyword, count=20, exclude=None):
+    exclude = set(exclude or [])
+    pool = []
+    for tmpl, typ, dem, comp, trend in MOCK_TEMPLATES:
+        title = tmpl.replace("{kw}", keyword.title())
+        if title not in exclude:
+            pool.append((title, typ, dem, comp, trend))
+    random.shuffle(pool)
+
+    # If we still don't have enough (e.g. repeated "load more" clicks), generate numbered variants
+    extra_round = 2
+    while len(pool) < count:
+        for tmpl, typ, dem, comp, trend in MOCK_TEMPLATES:
+            title = f"{tmpl.replace('{kw}', keyword.title())} Vol {extra_round}"
+            if title not in exclude:
+                pool.append((title, typ, dem, comp, trend))
+        extra_round += 1
+        if extra_round > 10:
+            break
+
+    raw = [
+        {"topic": p[0], "type": p[1], "demand": p[2], "competition": p[3], "trend_percent": p[4]}
+        for p in pool[:count]
     ]
-    result = []
-    for i, (tmpl, typ, dem, comp, trend) in enumerate(templates):
-        score = compute_opportunity_score(dem, trend, comp)
-        result.append({
-            "id": i + 1,
-            "topic": tmpl.replace("{kw}", keyword.title()),
-            "type": typ,
-            "demand": dem,
-            "competition": comp,
-            "trend_percent": float(trend),
-            "opportunity_score": score,
-        })
-    return result
+    return score_topics(raw)
 
 @app.post("/api/search")
 async def search_topics(req: SearchRequest):
+    count = max(1, min(req.max_results or 20, 40))
     api_key = get_groq_api_key()
     if api_key:
         try:
-            topics = await generate_topics_with_groq(req.keyword, api_key)
+            topics = await generate_topics_with_groq(req.keyword, api_key, count=count, exclude=req.exclude_topics)
         except Exception:
-            topics = generate_mock_topics(req.keyword)
+            topics = generate_mock_topics(req.keyword, count=count, exclude=req.exclude_topics)
     else:
-        topics = generate_mock_topics(req.keyword)
+        topics = generate_mock_topics(req.keyword, count=count, exclude=req.exclude_topics)
 
     if req.topic_type and req.topic_type != "all":
         label = "Main Topic" if req.topic_type == "main" else "Sub Topic"
@@ -229,6 +332,45 @@ async def search_topics(req: SearchRequest):
     conn.close()
 
     return {"keyword": req.keyword, "total": len(topics), "topics": topics}
+
+@app.post("/api/analyze-image")
+async def analyze_image(
+    file: UploadFile = File(...),
+    max_results: int = Form(20),
+    exclude_topics: Optional[str] = Form(None),
+):
+    api_key = get_groq_api_key()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Add a Groq API key in API Settings to use image analysis.")
+
+    contents = await file.read()
+    if len(contents) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large. Please use an image under 8MB.")
+
+    mime_type = file.content_type or "image/png"
+    image_b64 = base64.b64encode(contents).decode("utf-8")
+
+    try:
+        exclude = json.loads(exclude_topics) if exclude_topics else []
+    except Exception:
+        exclude = []
+
+    count = max(1, min(max_results or 20, 40))
+
+    try:
+        theme, topics = await generate_topics_from_image_with_groq(
+            image_b64, mime_type, api_key, count=count, exclude=exclude
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image analysis failed: {str(e)}")
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO search_history (keyword, results_count) VALUES (?, ?)", (f"[Image] {theme}", len(topics)))
+    conn.commit()
+    conn.close()
+
+    return {"keyword": theme, "total": len(topics), "topics": topics, "source": "image"}
 
 @app.get("/api/saved-topics")
 def get_saved_topics():
