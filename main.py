@@ -77,7 +77,7 @@ class SearchRequest(BaseModel):
     topic_type: Optional[str] = "all"
     category: Optional[str] = "all"
     country: Optional[str] = "worldwide"
-    time_range: Optional[str] = "past_12_months"
+    time_range: Optional[str] = "past_24_hours"
     max_results: Optional[int] = 20
     exclude_topics: Optional[List[str]] = None
 
@@ -186,19 +186,44 @@ def build_exclusion_text(exclude):
         + "\n- ".join(sample)
     )
 
-async def generate_topics_with_groq(keyword, api_key, count=20, exclude=None):
+TIME_RANGE_LABELS = {
+    "past_hour": "past 1 hour",
+    "past_4_hours": "past 4 hours",
+    "past_24_hours": "past 24 hours",
+    "past_week": "past 7 days",
+    "past_month": "past 30 days",
+    "past_3_months": "past 3 months",
+    "past_12_months": "past 12 months",
+    "past_5_years": "past 5 years",
+    "2004_present": "2004 to present",
+}
+
+COUNTRY_LABELS = {
+    "worldwide": "worldwide", "us": "United States", "gb": "United Kingdom",
+    "bd": "Bangladesh", "in": "India", "de": "Germany", "fr": "France",
+    "ca": "Canada", "au": "Australia", "br": "Brazil", "jp": "Japan",
+    "kr": "South Korea", "id": "Indonesia", "pk": "Pakistan", "sa": "Saudi Arabia",
+    "ae": "UAE", "ru": "Russia", "tr": "Turkey", "mx": "Mexico",
+    "it": "Italy", "es": "Spain", "nl": "Netherlands", "pl": "Poland",
+    "ng": "Nigeria", "za": "South Africa",
+}
+
+async def generate_topics_with_groq(keyword, api_key, count=20, exclude=None, time_range="past_24_hours", country="worldwide"):
     main_count = max(1, round(count * 0.25))
     sub_count = max(0, count - main_count)
     exclusion_text = build_exclusion_text(exclude)
+    time_label = TIME_RANGE_LABELS.get(time_range, "past 24 hours")
+    country_label = COUNTRY_LABELS.get(country, "worldwide")
 
     prompt = f"""Generate exactly {count} Adobe Stock content topics for the keyword "{keyword}".
+Focus on trending topics in {country_label} over the {time_label}.
 Mix of Main Topics ({main_count}) and Sub Topics ({sub_count}).
 For each topic return JSON with these fields:
 - topic: specific descriptive topic name
 - type: "Main Topic" or "Sub Topic"
-- demand: "High", "Medium", or "Low"
+- demand: "High", "Medium", or "Low" (based on {time_label} trend in {country_label})
 - competition: "Low", "Medium", or "High"
-- trend_percent: number between -15 and 45
+- trend_percent: number between -15 and 45 (reflect actual {time_label} trend momentum)
 {exclusion_text}
 
 Return ONLY a valid JSON array, no explanation, no markdown, no backticks."""
@@ -853,7 +878,7 @@ async def search_topics(req: SearchRequest):
     api_key = get_groq_api_key()
     if api_key:
         try:
-            topics = await generate_topics_with_groq(req.keyword, api_key, count=count, exclude=req.exclude_topics)
+            topics = await generate_topics_with_groq(req.keyword, api_key, count=count, exclude=req.exclude_topics, time_range=req.time_range or "past_24_hours", country=req.country or "worldwide")
         except Exception:
             topics = generate_mock_topics(req.keyword, count=count, exclude=req.exclude_topics)
     else:
